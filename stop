@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Stop all odoo19-mcp-chatbot local services (Odoo itself keeps running via Docker;
+# this only stops the proxy + tunnel watcher, mirroring tally-chatbot's stop script).
+
+GREEN='\033[0;32m'
+NC='\033[0m'
+
+echo -e "${GREEN}Stopping Odoo Chatbot services...${NC}\n"
+
+# Stop tunnel watcher (also kills its cloudflared child)
+if pgrep -f "watch-tunnel.sh" > /dev/null; then
+  pkill -f "watch-tunnel.sh"
+  echo -e "${GREEN}✓ Stopped tunnel watcher${NC}"
+else
+  echo "  Tunnel watcher not running"
+fi
+
+# Stop cloudflared directly too, in case it outlived the watcher
+if pgrep -f "cloudflared tunnel --url http://localhost:8788" > /dev/null; then
+  pkill -f "cloudflared tunnel --url http://localhost:8788"
+  echo -e "${GREEN}✓ Stopped cloudflared tunnel${NC}"
+fi
+
+# Stop proxy (match on the port, since start's exact uvicorn args can vary)
+if pgrep -f "uvicorn.*port 8788" > /dev/null; then
+  pkill -f "uvicorn.*port 8788"
+  echo -e "${GREEN}✓ Stopped proxy server${NC}"
+else
+  echo "  Proxy not running"
+fi
+
+sleep 1
+
+echo -e "\n${GREEN}All local services stopped.${NC}"
+echo "Note: Odoo itself (Docker) keeps running — 'docker compose down' in this folder to stop that too."
+echo -e "Log files still available:"
+echo "  /tmp/odoo-proxy.log"
+echo "  /tmp/odoo-cloudflared.log"
+echo "  /tmp/odoo-tunnel-watch.log"

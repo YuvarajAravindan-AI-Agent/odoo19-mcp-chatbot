@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# Startup wrapper for odoo19-mcp-chatbot — mirrors tally-chatbot's start script.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROXY_LOG="/tmp/odoo-proxy.log"
+TUNNEL_LOG="/tmp/odoo-cloudflared.log"
+WATCH_LOG="/tmp/odoo-tunnel-watch.log"
+STATE_FILE="$HOME/.config/odoo-chatbot/tunnel_url"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+echo -e "${GREEN}=== Odoo Chatbot Startup ===${NC}\n"
+
+echo "Checking prerequisites..."
+
+# 1. Check Odoo is up (docker compose, restart:unless-stopped so usually already running)
+if ! timeout 2 bash -c "</dev/tcp/127.0.0.1/8069" 2>/dev/null; then
+  echo -e "${YELLOW}⚠ Odoo not responding on :8069 — starting containers...${NC}"
+  (cd "$SCRIPT_DIR" && docker compose up -d)
+  sleep 3
+fi
+
+# 2. Check proxy venv exists
+if [ ! -d "$SCRIPT_DIR/proxy/.venv" ]; then
+  echo -e "${RED}✗ Error: Python venv not found at proxy/.venv${NC}"
+  echo "  Run: cd proxy && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"
+  exit 1
+fi
+
+# 3. Check cloudflared is installed
+if [ ! -f "$HOME/bin/cloudflared" ]; then
+  echo -e "${RED}✗ Error: cloudflared not found at ~/bin/cloudflared${NC}"
+  exit 1
+fi
+
+echo -e "${GREEN}✓ Prerequisites OK${NC}\n"
+
+# Start proxy
+echo "Starting proxy server on port 8788..."
+if ss -tln 2>/dev/null | grep -q ':8788'; then
+  echo -e "${GREEN}✓ Proxy already running on :8788${NC}"
+else
+  setsid "$SCRIPT_DIR/proxy/.venv/bin/uvicorn" --app-dir "$SCRIPT_DIR/proxy" main:app \
+    --host 127.0.0.1 --port 8788 >"$PROXY_LOG" 2>&1 < /dev/null &
+  sleep 2
+
+  if ss -tln 2>/dev/null | grep -q ':8788'; then
+    echo -e "${GREEN}✓ Proxy started (log: $PROXY_LOG)${NC}"
+  else
+    echo -e "${RED}✗ Proxy failed to start. Check $PROXY_LOG:${NC}"
+    cat "$PROXY_LOG"
+    exit 1
+  fi
+fi
+
+# Start the tunnel watcher (cloudflared quick tunnel + auto-sync to Vercel on URL change)
+echo "Starting tunnel watcher..."
+if pgrep -f "watch-tunnel.sh" >/dev/null 2>&1; then
+  echo -e "${GREEN}✓ Tunnel watcher already running${NC}\n"
+else
+  : >"$WATCH_LOG"
+  setsid "$SCRIPT_DIR/watch-tunnel.sh" >/dev/null 2>&1 < /dev/null &
+  echo "  waiting for tunnel + Vercel sync (can take ~45s)..."
+  for _ in $(seq 1 90); do
+    [ -s "$STATE_FILE" ] && grep -q "sync complete" "$WATCH_LOG" 2>/dev/null && break
+    sleep 1
+  done
+  if [ -s "$STATE_FILE" ]; then
+    echo -e "${GREEN}✓ Tunnel up + synced to Vercel${NC}\n"
+  else
+    echo -e "${YELLOW}⚠ Tunnel still starting — check $WATCH_LOG${NC}\n"
+  fi
+fi
+
+TUNNEL_URL=$(cat "$STATE_FILE" 2>/dev/null || echo "(pending — check $WATCH_LOG)")
+
+echo -e "${GREEN}========================================${NC}"
+echo -e "${GREEN}✓ Odoo Chatbot is ready!${NC}"
+echo -e "${GREEN}========================================${NC}\n"
+
+echo "Local Services:"
+echo "  Odoo:     http://127.0.0.1:8069 (internal)"
+echo "  Proxy:    http://127.0.0.1:8788 (internal)"
+echo "  Tunnel:   $TUNNEL_URL (public, changes on restart — auto-synced to Vercel)"
+echo ""
+echo "Access Chatbot:"
+echo "  https://odoo-chatbot-mu.vercel.app"
+echo ""
+echo "Test it:"
+echo "  1. Open the chatbot URL"
+echo "  2. Enter passcode: demo1234"
+echo "  3. Ask: 'What is my total receivables?'"
+echo ""
+echo "Logs:"
+echo "  tail -f $PROXY_LOG   (proxy debug)"
+echo "  tail -f $TUNNEL_LOG  (tunnel debug)"
+echo "  tail -f $WATCH_LOG   (watcher / Vercel sync debug)"
+echo ""
+echo "Stop services:"
+echo "  ./stop"
+echo ""
